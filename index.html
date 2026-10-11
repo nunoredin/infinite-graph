@@ -1,0 +1,1733 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+<title>Infinite Graph</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #0e1013; }
+  body {
+    display: flex; align-items: center; justify-content: center;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  /* portrait frame (55cm x 88cm), letterboxed inside whatever window it
+     gets. Square corners and no shadow: when this is projected onto a
+     physical rectangle, rounded corners and a drop shadow would show up in
+     the projection. */
+  #stage {
+    display: block;
+    width: min(100vw, 62.5vh);
+    aspect-ratio: 55 / 88;
+    background: #f6f5f2;
+  }
+</style>
+</head>
+<body>
+<canvas id="stage"></canvas>
+<script>
+(() => {
+  "use strict";
+
+  const canvas = document.getElementById("stage");
+  const ctx = canvas.getContext("2d");
+
+  /* ================================================================== *
+   *  MEDIA
+   *  A looping video plus a bank of stills. Each becomes a "card"
+   *  placed at a random spot in the scroll. Nothing bends a card except a
+   *  live earthquake - on a quiet signal the whole page stays orthogonal.
+   * ================================================================== */
+
+  // Several independent playheads into the same source clip.
+  // Each video band is pinned to one of these while it is on screen, and each
+  // stream was started at its own random point in the material, so a
+  // screenful of bands shows a screenful of different moments. Because the
+  // streams are PLAYING rather than being seeked, nothing has to be
+  // re-decoded per frame.
+  //
+  // `base_web.mp4` is `base_cropped.mov` re-encoded for the web: same picture
+  // (1698x2152 portrait, black pillarbox already cropped out of the pixels),
+  // scaled to 1080 wide, H.264 CRF 26, +faststart. 130MB instead of 832MB so
+  // it fits GitHub Pages' 100MB-per-file limit. The old `contentBox()`
+  // detector is kept as a harmless no-op fallback (it finds the whole frame),
+  // but the bars are gone at the source now.
+  const MOV_SRC = encodeURI("base_web.mp4");
+  // HOW MANY INDEPENDENT 4K PLAYHEADS. Every stream is a separate decode of a
+  // 3840x2160 stream, so this is the single biggest fixed cost on a weaker GPU —
+  // and it is paid whether or not the bands are visible. Six is the default for
+  // "a screenful of different moments"; cut it to 2 or 3 for a big frame rate
+  // win on a slow machine (the piece still works — bands just share a playhead
+  // more often). Change and reload.
+  const N_STREAM = 6;
+  const streams = [];
+
+  function addStream() {
+    const v = document.createElement("video");
+    v.muted = true; v.loop = true; v.autoplay = true;
+    v.playsInline = true; v.preload = "auto";
+    v.style.cssText =
+      "position:fixed;left:-2px;top:-2px;width:2px;height:2px;opacity:0;pointer-events:none;";
+    v.src = MOV_SRC;
+    document.body.appendChild(v);
+    // spread the playheads over the whole sixteen minutes, so no two agree
+    const seek = () => {
+      const d = v.duration;
+      if (d && isFinite(d)) {
+        try { v.currentTime = Math.random() * d; } catch (e) {}
+      }
+      const p = v.play(); if (p) p.catch(() => {});
+    };
+    v.addEventListener("loadedmetadata", seek, { once: true });
+    streams.push(v);
+  }
+  for (let i = 0; i < N_STREAM; i++) addStream();
+
+  // Browsers may refuse to autoplay until the page has been interacted with,
+  // so every stream is nudged again on the first user gesture.
+  function tryPlay() {
+    for (const v of streams) {
+      const p = v.play();
+      if (p) p.catch(() => {});
+    }
+  }
+  tryPlay();
+
+  // Give each video band a stream while it is on screen. Bands that overlap
+  // get different streams, so adjacent pictures never show the same moment.
+  // Only bands actually near the plot count as "in use", so the pool is not
+  // drained by cards that have long since scrolled away.
+  function assignStream(c) {
+    const inUse = new Set();
+    const top = offset - PAD.top;
+    const lo = top - tileH, hi = top + plotH + tileH * 2;
+    for (const o of CARDS.values()) {
+      if (!o.isVideo || o === c || o.stream === undefined) continue;
+      if (o.worldY + o.h < lo || o.worldY > hi) continue;
+      inUse.add(o.stream);
+    }
+    for (let i = 0; i < N_STREAM; i++) if (!inUse.has(i)) { c.stream = i; return; }
+    c.stream = Math.floor(Math.random() * N_STREAM);
+  }
+
+  // Stills: 001sr.jpeg .. 103sr.jpeg, plus one simwiki extra, plus the
+  // earthquake-damage bank from ./eq/.
+  const IMG = [];
+  const N_SR = 103;
+  for (let i = 1; i <= N_SR; i++) IMG.push(String(i).padStart(3, "0") + "sr.jpeg");
+  // NOTE: the old list also had "DD_aproximadas10_resize.jpg", which is not in
+  // the folder any more - it 404'd and cards that picked it rendered blank.
+  IMG.push("simwiki-stress-strain-shape-evolution.png");
+  // Earthquake-damage stills pulled from Wikimedia Commons
+  // (Category:Earthquake_damage) by `fetch_eq_images.mjs`, live in ./eq/.
+  // They are mixed into the SAME pool, so they take their fair share of cards.
+  const N_EQ = 50;
+  for (let i = 1; i <= N_EQ; i++) IMG.push("eq/eq_" + String(i).padStart(2, "0") + ".jpg");
+  const imgFor = (seed) => IMG[seed % IMG.length];
+
+  const RW = 200, RH = 250;              // prepared image size (4:5)
+  const CARD_AR = RW / RH;
+
+  const threshold = document.createElement("canvas");
+  const tctx = threshold.getContext("2d");
+
+  // Video bands show the footage UNTOUCHED. The 4K frame is downscaled ONCE
+  // per stream per frame into a scratch sized to what a band actually shows,
+  // then the mesh slices that scratch at 1:1. Doing the hard resample once
+  // is what makes this cheap: smoothing each of the ~1360 mesh tiles
+  // individually instead cost ~7fps.
+  const vband = [];                                  // one scratch per stream
+  const vbandctx = [];
+  let bandW = 0, bandH = 0;
+  for (let i = 0; i < N_STREAM; i++) {
+    const cv = document.createElement("canvas");
+    vband.push(cv);
+    vbandctx.push(cv.getContext("2d"));
+  }
+
+  // Match the scratch to a band's on-screen size, in DEVICE pixels, so the
+  // downscale happens here rather than in every tile.
+  function ensureBandBuffers() {
+    const w = Math.max(2, Math.round(plotW * dpr));
+    const h = Math.max(2, Math.round(w * (9 / 16) * 1.3));
+    if (w === bandW && h === bandH) return;
+    bandW = w; bandH = h;
+    for (let i = 0; i < N_STREAM; i++) {
+      vband[i].width = w; vband[i].height = h;
+      // this one draw IS the expensive resample, so make it a good one
+      vbandctx[i].imageSmoothingEnabled = true;
+      vbandctx[i].imageSmoothingQuality = "high";
+    }
+  }
+
+  // `base .mov` is a 3840x2160 frame with the picture PILLARBOXED: the real
+  // image only occupies x 1060..2780 and the rest is baked-in black. Cover-
+  // cropping the full frame dragged those bars into every band, which is what
+  // read as "blocky". Find the content box once and crop to it instead.
+  let movBox = null;                 // {x,y,w,h} in source pixels
+  let movBoxBlocked = false;         // getImageData threw (tainted) - stop trying
+  function contentBox(v) {
+    if (movBox) return movBox;
+    if (movBoxBlocked) return null;   // never re-try a throwing read every frame
+    const W = v.videoWidth, H = v.videoHeight;
+    if (!W || !H) return null;
+    // DETECT AT NATIVE RESOLUTION. The pillarbox edge used to be found on a
+    // 192px-wide thumbnail, where one sample column is ~20 SOURCE px wide - so
+    // the detected edge could sit up to ~20px inside the picture, and cropping
+    // to it left a sliver of the file's baked-in black on each side of every
+    // band (measured: ~2.5 CSS px, a visible black border). A full-resolution
+    // read pins the edge to ~1 source px, so the crop lands on the real picture.
+    // This runs ONCE (the box is cached); the read is ~30MB on a 4K source,
+    // which is nothing next to decoding six 4K streams.
+    const cv = document.createElement("canvas");
+    cv.width = W; cv.height = H;
+    const g = cv.getContext("2d", { willReadFrequently: true });
+    g.drawImage(v, 0, 0);
+    let d;
+    // A cross-origin / file:// video makes this canvas TAINTED, so getImageData
+    // throws EVERY time. Give up once and fall back to the full frame.
+    try { d = g.getImageData(0, 0, W, H).data; }
+    catch (e) { movBoxBlocked = true; return null; }
+    const lum = (x, y) => { const i = (y * W + x) * 4; return 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]; };
+    // step 2 in both directions: half the work, still exact to the sampled px
+    const colMean = x => { let s = 0, n = 0; for (let y = 0; y < H; y += 2) { s += lum(x, y); n++; } return s / n; };
+    const rowMean = y => { let s = 0, n = 0; for (let x = 0; x < W; x += 2) { s += lum(x, y); n++; } return s / n; };
+    let x0 = 0, x1 = W - 1, y0 = 0, y1 = H - 1;
+    while (x0 < x1 && colMean(x0) < 8) x0++;
+    while (x1 > x0 && colMean(x1) < 8) x1--;
+    while (y0 < y1 && rowMean(y0) < 8) y0++;
+    while (y1 > y0 && rowMean(y1) < 8) y1--;
+    // only trust it if it actually found a picture; otherwise leave the full frame
+    if (x1 - x0 < W * 0.2 || y1 - y0 < H * 0.2) return null;
+    movBox = { x: x0, y: y0, w: x1 - x0 + 1, h: y1 - y0 + 1 };
+    return movBox;
+  }
+
+  // Draw one stream's frame, cropped to the real picture and cover-fitted to
+  // the band's aspect, and hand back the scratch. The crop is done here so the
+  // mesh needs no crop.
+  function paintStream(i) {
+    const v = streams[i];
+    if (!v || v.readyState < 2) return null;
+    ensureBandBuffers();
+    const W = v.videoWidth, H = v.videoHeight;
+    if (!W || !H) return null;
+    const box = contentBox(v) || { x: 0, y: 0, w: W, h: H };
+    let sw = box.w, sh = box.h, sx = box.x, sy = box.y;
+    const boxAR = bandW / bandH;
+    if (sw / sh > boxAR) { const nw = sh * boxAR; sx += (sw - nw) / 2; sw = nw; }
+    else { const nh = sw / boxAR; sy += (sh - nh) / 2; sh = nh; }
+    const g = vbandctx[i];
+    g.setTransform(1, 0, 0, 1, 0, 0);
+    g.imageSmoothingEnabled = true;
+    g.imageSmoothingQuality = "high";
+    g.clearRect(0, 0, bandW, bandH);
+    g.drawImage(v, sx, sy, sw, sh, 0, 0, bandW, bandH);
+    return vband[i];
+  }
+
+  // Stills get the hard threshold; the video is left alone.
+  const FILTER_IMG = "grayscale(1) brightness(1.05) contrast(235%)"; // normal photo
+
+  /* ================================================================== *
+   *  Layout
+   * ================================================================== */
+  const PAD = { top: 40, right: 40, bottom: 52, left: 76 };
+  const CYCLE_UNITS = 1000;
+  const MAJOR_UNITS = 200;
+  const MINOR_UNITS = 40;
+  const VALUE_TICKS = [0, 100, 200, 300, 400, 500, 600];
+  let pxPerUnit = 1, periodPx = 1;
+  let W = 0, H = 0, dpr = 1;
+  let plotW = 0, plotH = 0, baseY = 0, baseX = 0, amp = 0;
+  let tileW = 1, tileH = 1;
+
+  // Canvas resolution is CAPPED to a pixel budget, separately from `dpr`.
+  //
+  // WHY: the frame cost here is almost entirely "how many device pixels does the
+  // GPU have to fill and composite every frame", and it is roughly linear in the
+  // backing-store size. Measured on a canvas that is only 1.2 Mpx this runs at a
+  // locked 60fps, and the JS side is ~0.2-0.7ms; but at ~10 Mpx (a big Chrome
+  // window at devicePixelRatio 2) the same page drops to **17-30fps with the JS
+  // still under 1ms**. Nothing in the code is slow - the rasteriser is simply
+  // filling 8x the pixels.
+  //
+  // So the backing store (the `canvas.width/height` bitmap) is what gets capped,
+  // NOT the CSS size: the piece still fills the screen and lays out identically,
+  // it just renders at a slightly lower pixel density when the window is huge.
+  // The cap only ever REDUCES dpr, and only kicks in well above a full-screen
+  // 1080p window, so a normal window is untouched (dpr stays 2).
+  const MAX_CANVAS_PX = 4.2e6;         // ~4.2M device px budget for the bitmap
+  function layout() {
+    W = canvas.clientWidth;
+    H = canvas.clientHeight;
+    // cap the BACKING STORE, then (re)assign dpr from the cap (see above)
+    const capDpr = Math.sqrt(MAX_CANVAS_PX / Math.max(1, W * H));
+    dpr = Math.min(window.devicePixelRatio || 1, 2, Math.max(0.35, capDpr));
+    canvas.width = Math.round(W * dpr);
+    canvas.height = Math.round(H * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    plotW = Math.max(10, W - PAD.left - PAD.right);
+    plotH = Math.max(10, H - PAD.top - PAD.bottom);
+    baseY = PAD.top + plotH;
+    baseX = PAD.left;
+    amp = plotW * 0.84;
+    periodPx = Math.max(160, plotH * 0.85);
+    pxPerUnit = periodPx / CYCLE_UNITS;
+    tileW = plotW;
+    tileH = plotW * (RH / RW);
+  }
+
+  /* ================================================================== *
+   *  Cards — a deterministic, sparse scatter through the scroll. Only a
+   *  fraction of the slots are filled, so the graph is never engulfed.
+   * ================================================================== */
+  const CARDS = new Map();
+  const SLOT_PX = 250;                 // average vertical spacing between items
+  let nextSeed = 1;
+
+  function makeCard(index) {
+    const r = (n) => {
+      const s = Math.sin(index * 127.1 + n * 311.7) * 43758.5453;
+      return s - Math.floor(s);
+    };
+    const seed = Math.floor(r(0.5) * 1e9);
+    const isVideo = r(9) < 0.30;
+    // some stills stay untouched - the original photo as it is
+    const orig = r(6) < 0.40;
+    if (isVideo) {
+      // full-bleed band: spans the plot, taller than the 16:9 frame so the
+      // footage reads bigger (the mesh cover-crops it, so nothing stretches)
+      const h = plotW * 9 / 16 * 1.3;
+      return {
+        worldY: index * SLOT_PX + (r(3) - 0.5) * (SLOT_PX - h),
+        h, w: plotW, x: PAD.left,
+        isVideo: true, seed, orig,
+      };
+    }
+    // stills: large and loosely randomised in size, aspect and placement
+    const scale = 0.18 + r(2) * 0.14;              // card height as a fraction
+    const cardH = Math.max(180, plotH * scale);
+    const ar = 0.55 + r(5) * 0.85;                 // 0.55 .. 1.40 width/height
+    const w = cardH * ar;
+    const jitter = (r(3) - 0.5) * (SLOT_PX - cardH) * 0.8;
+    const x = PAD.left + (plotW - w) * (0.05 + r(4) * 0.9);
+    const c = {
+      worldY: index * SLOT_PX + jitter,
+      h: cardH, w: Math.min(w, plotW),
+      x: Math.max(PAD.left + 2, Math.min(PAD.left + plotW - Math.min(w, plotW) - 2, x)),
+      isVideo: false, seed, orig,
+      imgKey: imgFor(seed),
+      tex: null, prepared: false, el: null,
+    };
+    c.tex = document.createElement("canvas");
+    c.tex.width = RW; c.tex.height = RH;
+    c.tx = c.tex.getContext("2d");
+    return c;
+  }
+
+  function ensureCards(from, to) {
+    const first = Math.floor(from / SLOT_PX) - 2;
+    const last = Math.ceil(to / SLOT_PX) + 2;
+    // Drop the cards that have scrolled away. The scroll is endless, so
+    // keeping every card ever made would grow without bound - and it would
+    // also keep every video stream marked "in use", starving the pool.
+    for (const i of CARDS.keys()) {
+      if (i < first || i > last) CARDS.delete(i);
+    }
+    for (let i = first; i <= last; i++) {
+      if (!CARDS.has(i)) {
+        const c = makeCard(i);
+        // A video band pins itself to one of the hidden plays for as long as
+        // it is alive, so its scene is steady. Which stream it gets is
+        // decided by `assignStream`, so two bands on screen at once never
+        // share one.
+        CARDS.set(i, c);
+        if (c.isVideo) assignStream(c);
+      }
+    }
+  }
+
+  function prepareCard(c) {
+    if (c.isVideo) return prepareVideoCard(c);
+    return prepareImageCard(c);
+  }
+
+  function prepareVideoCard(c) {
+    return;                               // drawn straight from its stream
+  }
+
+  function prepareImageCard(c) {
+    if (c.prepared) return;
+    if (!c.loaded && c.failed === undefined) {
+      if (!c.el) {
+        c.el = new Image();
+        c.el.onload = () => { c.loaded = true; };
+        c.el.onerror = () => { c.failed = true; };
+        c.el.src = encodeURI(c.imgKey);
+      }
+    }
+    if (!c.loaded) return;
+    if (threshold.width !== RW) { threshold.width = RW; threshold.height = RH; }
+    tctx.setTransform(1, 0, 0, 1, 0, 0);
+    // originals are left alone; the rest get the hard threshold
+    tctx.filter = c.orig ? "none" : FILTER_IMG;
+    tctx.clearRect(0, 0, RW, RH);
+    tctx.drawImage(c.el, 0, 0, RW, RH);
+    tctx.filter = "none";
+    c.tx.setTransform(1, 0, 0, 1, 0, 0);
+    c.tx.globalCompositeOperation = "source-over";
+    c.tx.clearRect(0, 0, RW, RH);
+    c.tx.drawImage(threshold, 0, 0);
+    c.prepared = true;
+  }
+
+  /* ================================================================== *
+   *  Warp — cards are moved by exactly one thing: a live earthquake.
+   *  With no quake on screen every picture sits squarely on the grid, so
+   *  the page reads as an orthogonal, clean signal.
+   * ================================================================== */
+  /* --- the trace as a warp ------------------------------------------------
+   * A quake BENDS every picture, and it is the pictures' OWN edges that end up
+   * tracing the spike: each card is sheared sideways by the pen's curve, so its
+   * left and right borders take on the shape of the seismogram. Cards the wave
+   * only reaches at a distance still take a share of it, so the whole page
+   * bends, not just the rail.
+   *
+   * THE DISPLACEMENT IS AFFINE, AND THAT IS THE WHOLE TRICK. It is a sideways
+   * displacement that depends on `y` and NOT on `x`, so the Jacobian
+   * determinant is 1 and it CANNOT fold, however large the amplitude - that is
+   * the difference from the version that shredded cards, whose field was
+   * arbitrary and folded on itself. And because it is affine it is a single
+   * `drawImage` under a transform instead of a per-tile mesh, which is where
+   * the entire performance win comes from (see `drawCards`).
+   *
+   * AND NOTHING IS CLIPPED ANY MORE. Cutting a card along the seam is exactly
+   * what produced the triangular shards the user rejected; the edge now comes
+   * from the warp, so the picture stays one whole piece.
+   * ---------------------------------------------------------------------- */
+  /* A QUAKE NO LONGER MOVES A PICTURE AT ALL — IT DISTORTS IT IN PLACE.
+   *
+   * History worth keeping, because it explains why the code looks the way it
+   * does: this used to be a per-tile mesh (`clip` + `setTransform` + `drawImage`
+   * per cell) that cost **~2.3ms per card** — two cards in view ate a whole
+   * 16.7ms frame. It was then reduced to ONE affine `drawImage` under a shear,
+   * because the displacement depended on `y` but not on `x` (determinant 1, so
+   * it could never fold). That was fast but it MADE THE PICTURES SWING from side
+   * to side, which the user rejected outright.
+   *
+   * So the mesh is back, but it is a different mesh doing a different job. It no
+   * longer MOVES anything: it cuts the picture into strips in place and
+   * stretches the pixels between the cuts. See the tear note below, and note
+   * that the cost is bounded — only a card the quake actually reaches pays it,
+   * and even when a whole screen is torn the budget is fine (measured 60fps). */
+
+  const cardScreenTop = (c) => c.worldY - offset + PAD.top;
+
+  /* Chaos knobs, live-tunable from the console: window.__chaos({...}) */
+  const EQK = {
+    tear: 1.00,     // how hard a quake shreds the pictures it reaches
+    reach: 1.90,    // how far that reaches, in plot widths
+    marks: 1.00,    // how strongly the tears are inked
+    glitch: 1.00,   // how far bands are thrown sideways (0 = bands stay put)
+    drag: 0.90,     // how much a needle drags the rows it crosses along with it
+    rate: 7,        // how many times a second the damage re-rolls (0 = frozen)
+    spill: 1.00,    // how far the shred frays PAST a picture's own border, into
+                    // its neighbours (0 = strictly inside each box as before);
+                    // never past the PLOT - `drawCards` keeps that clip shut at all times
+    grid: 0.55,     // how hard the spikes push the graph's vertical lines (0 = rigid grid)
+  };
+  window.__chaos = (o) => { if (o) Object.assign(EQK, o); return Object.assign({}, EQK); };
+
+  /* ================================================================== *
+   *  THE EARTHQUAKE SHREDS THE PICTURES AROUND IT, IN PLACE
+   *
+   *  A quake never MOVES a picture: nothing swings, nothing is dragged, nothing
+   *  leaves its own box. It reaches into the pictures near the needles and
+   *  GLITCHES THEM from the inside, like a tape machine chewing a frame:
+   *
+   *    - the picture is cut into many thin horizontal BANDS, uneven in height;
+   *    - each band takes its damage from the pen AT THAT BAND'S OWN ROW, so the
+   *      wreckage follows the real needles as the burst sweeps down the page;
+   *    - a damaged band is THROWN SIDEWAYS, wrapping around inside the box;
+   *    - it is also stretched or squashed vertically (the pixels are really
+   *      stretched, not just slid);
+   *    - a few bands are SMEARED (a thin sliver of the picture pulled across the
+   *      whole band) and a few are INVERTED;
+   *    - a hit band BLEEDS: a ragged fringe of its own edge pixels is stretched
+   *      out PAST the picture's border (`EQK.spill`), so the damage spills onto
+   *      the pictures around it as jagged edges - but never out of the graph:
+   *      `drawCards` always clips the whole set to the plot rect;
+   *    - the worst breaks are inked, and those cracks run past the edge too;
+   *    - the whole pattern RE-ROLLS several times a second (`EQK.rate`), so it
+   *      reads as live damage and not as a still.
+   *
+   *  NOTHING IS ERASED, AND THAT IS STRUCTURAL, NOT TUNED:
+   *    1. The destination band edges run 0..1, are monotone, and the first and
+   *       last are welded to the box top and bottom, so the bands tile the box
+   *       exactly: no gap, no overlap, and every source row is drawn.
+   *    2. A sideways throw WRAPS and every band is still drawn at the FULL box
+   *       width, so the box is always completely covered by the picture. The
+   *       jagged bleed is drawn ON TOP of that intact core, so it can only ADD
+   *       material outside the border - it cannot thin or erase the picture.
+   *    3. A stretch is bounded (about 0.15x .. 6x after normalising), so a
+   *       squashed band is thin but never zero, and it cannot invert or mirror.
+   *    4. Smears and inversions are capped per card and only ever hit THIN bands.
+   *    5. The bleed only ever extends the CARD's own clip C, never the plot
+   *       clip: `drawCards` clips the whole set to the plot rect and is never
+   *       opened, so a fray past one picture's border is still scissored to the
+   *       graph and can never leave the graphed area.
+   *
+   *  There is no per-point mesh anywhere: each band is one axis-aligned rect in
+   *  and one out, so it cannot fold or shred itself the way a point field did.
+   *  A video band's source is a CANVAS, so its size is read from `.width`; the
+   *  old `|| RW` fallback made a torn video sample only a 200x250 corner.
+   * ================================================================== */
+  let frameUnix = 0;    // milliseconds, for the marks' jitter
+
+  // A deterministic hash in [0, 1) of (a card's seed, a, b). Everything the
+  // shredder does is a pure function of this, so a card's damage is fixed
+  // inside an epoch and only re-rolls when the epoch ticks over.
+  function rnd(seed, a, b) {
+    let h = Math.imul(seed | 0, 0x27d4eb2d) ^ Math.imul(a | 0, 0x165667b1) ^ Math.imul(b | 0, 0x9e3779b1);
+    h = Math.imul(h ^ (h >>> 15), 0x85ebca6b);
+    h = Math.imul(h ^ (h >>> 13), 0xc2b2ae35);
+    h ^= h >>> 16;
+    return (h >>> 0) / 4294967296;
+  }
+
+  // Scratch tables, reused every frame so a storm does not churn the GC. Bands
+  // are drawn one card at a time, so a single set is safe.
+  const MAXB = 48;
+  const bW = new Float32Array(MAXB);       // raw band weights
+  const bS = new Float32Array(MAXB + 1);   // source edges, 0..1
+  const bD = new Float32Array(MAXB + 1);   // destination edges, 0..1
+  const bR = new Float32Array(MAXB);       // stretched band heights
+  const bI = new Float32Array(MAXB);       // damage intensity per band
+  const bDx = new Float32Array(MAXB);      // sideways throw per band, px
+  const bK = new Uint8Array(MAXB);         // bit 1 = smeared, bit 2 = inverted
+  const bTop = new Float32Array(MAXB);     // snapped destination top, px
+  const bSl = new Float32Array(MAXB);      // smear sliver start, fraction of width
+  const bPicked = new Uint8Array(MAXB);    // which bands already carry ink
+
+  // The displacement the spikes put on the GRID this frame, sampled down the
+  // plot ONCE per frame and reused by every vertical line (they all share the
+  // pen's waveform - see `drawGrid`). `EQ_GRID_N` samples; row i is at
+  // `PAD.top + plotH*i/EQ_GRID_N`. Module-level so the frame does not allocate.
+  const EQ_GRID_N = 110;
+  const gridShift = new Float32Array(EQ_GRID_N + 1);
+
+  /* How hard the quake is hitting this card as a whole: 0 = out of reach, up
+   * to ~2 right on a big needle. This only decides WHETHER a card is shredded
+   * and how much headroom its bands get; the damage itself is per band (see
+   * `drawTornCard`), read from the pen at each band's own row.
+   *
+   * It looks at several rows down the card, not just its centre: the burst's
+   * leading edge sweeps down the page, so a card can be hit in its top half
+   * while the pen is still dead straight at its centre row, and a centre-only
+   * test would skip it entirely. */
+  function cardTear(c) {
+    if (!eqGeom) return 0;
+    const top = cardScreenTop(c);
+    const cx = c.x + c.w * 0.5;
+    const reachPx = plotW * EQK.reach;
+    let best = 0;
+    for (let k = 0; k < 6; k++) {
+      const v = seismoSample(top + c.h * (k + 0.5) / 6);
+      if (v === null) continue;                 // the line is straight here
+      const d = Math.abs(railX + v * eqGeom.peak - cx) / reachPx;
+      if (d >= 1) continue;
+      // a needle that has died away barely counts, a tall one counts in full
+      const amp = Math.min(1, 0.25 + Math.abs(v) * 2.5);
+      const near = Math.pow(1 - d, 0.9) * amp;
+      if (near > best) best = near;
+    }
+    if (best <= 0) return 0;
+    // the swell makes the same needle bite harder and softer over a few seconds,
+    // so the page breathes instead of holding one fixed level of damage
+    const swell = 1.15 + 0.45 * Math.sin(nowS * 0.45 + c.seed * 0.00001);
+    return Math.min(2.2, best * EQK.tear * swell * 1.35);
+  }
+
+  /* BUILD THE BAND TABLES for one card at one instant.
+   *
+   * Fills the module scratch arrays and returns the band count `n`. For band k
+   * the SOURCE rows are `[bS[k], bS[k+1]]` (even, 0..1) and the DESTINATION
+   * rows are `[bD[k], bD[k+1]]` (uneven, 0..1). A band is stretched by
+   * `dst height / src height`, which is `bR[k] * n`.
+   *
+   * The damage of each band is read from the pen AT THAT BAND'S OWN ROW, so the
+   * wreckage follows the real needles and the burst visibly sweeps down the
+   * picture. `epoch` ticks `EQK.rate` times a second and re-rolls every random
+   * number, so the damage crawls and flickers like live tape damage.
+   *
+   * WHY THE BAND HEIGHTS ARE NORMALISED (the structural no-erasure part):
+   * `bR[k]` is a raw random height; they are divided by their sum so the
+   * destination edges tile 0..1 exactly, then the last edge is pinned to 1.
+   * `lo`/`hi` keep a band between ~0.15x and ~6x its even share, so a band can
+   * be squashed hard but never reaches zero height and never inverts. */
+  function buildBands(c, tear, epoch) {
+    const n = Math.max(9, Math.min(MAXB, Math.round(c.h / 11)));
+    const reachPx = plotW * EQK.reach;
+    const cx = c.x + c.w * 0.5;
+    const top = cardScreenTop(c);
+    let sumW = 0;
+    for (let k = 0; k < n; k++) {
+      const row = top + c.h * (k + 0.5) / n;
+      const v = seismoSample(row);
+      // How hard this band is hit. The pen's own offset is the needle; a band
+      // that sits on a tall needle takes the full hit, and one just beside it
+      // still takes a share, so the damage reads as a front and not as one row.
+      let hit = 0;
+      if (v !== null) {
+        const nx = railX + v * eqGeom.peak;
+        const d = Math.abs(nx - cx) / reachPx;
+        if (d < 1) hit = Math.pow(1 - d, 0.7) * Math.min(1, 0.30 + Math.abs(v) * 3.0);
+      }
+      // a card that is hit at all keeps a floor, so a band between needles is
+      // still visibly disturbed and the card never half-recovers mid-storm
+      hit = Math.min(1.6, hit * tear + 0.18 * Math.min(1, tear));
+      bI[k] = hit;
+      // uneven raw heights: hit bands are pushed far from the even share, both
+      // fat and thin, which is what makes the picture read as shredded
+      const r = rnd(c.seed, k * 7 + 1, epoch);
+      const swing = Math.min(0.92, hit * 0.75);
+      const f = r < 0.5 ? 1 - swing * (1 - r * 2) : 1 + swing * 3.2 * (r * 2 - 1);
+      bW[k] = Math.max(0.15, f);
+      sumW += bW[k];
+    }
+    let acc = 0;
+    for (let k = 0; k < n; k++) {
+      bS[k] = k / n;
+      bD[k] = acc;
+      acc += bW[k] / sumW;
+      bR[k] = (bW[k] / sumW) * n;        // stretch ratio (1 = untouched)
+    }
+    bS[n] = 1; bD[n] = 1;                // weld both ends to the box
+    // sideways throw, smear and inversion flags per band
+    const maxThrow = c.w * 0.62 * EQK.glitch;
+    let smears = 0, flips = 0;
+    for (let k = 0; k < n; k++) {
+      const h = bI[k];
+      bK[k] = 0; bDx[k] = 0; bPicked[k] = 0;
+      if (h <= 0.001) continue;
+      const rr = rnd(c.seed, k * 11 + 3, epoch);
+      const rs = rnd(c.seed, k * 13 + 5, epoch) * 2 - 1;
+      // the throw grows with the hit, with a heavy tail so a few bands go far
+      let dx = rs * maxThrow * Math.min(1, h) * (0.15 + 0.85 * rr * rr);
+      // a needle DRAGS the rows it crosses: bias the throw toward the needle,
+      // so the picture is pulled along with the pen instead of wobbling at random
+      const v = seismoSample(top + c.h * (k + 0.5) / n);
+      if (v !== null && EQK.drag > 0) {
+        const pull = (railX + v * eqGeom.peak - cx);
+        dx += Math.max(-maxThrow, Math.min(maxThrow, pull * EQK.drag * Math.min(1, h)));
+      }
+      bDx[k] = dx;
+      const thin = bR[k] < 0.8;
+      if (thin && h > 0.55 && smears < 4 && rnd(c.seed, k * 17 + 7, epoch) < 0.30) {
+        bK[k] |= 1; smears++;
+        bSl[k] = rnd(c.seed, k * 19 + 9, epoch) * 0.85;
+      }
+      if (thin && h > 0.75 && flips < 3 && rnd(c.seed, k * 23 + 11, epoch) < 0.22) {
+        bK[k] |= 2; flips++;
+      }
+    }
+    return n;
+  }
+
+  /* ================================================================== *
+   *  LIVE EARTHQUAKES — ONE PEN, ONE LINE
+   *
+   *  The graph is dead straight. A single pen rides ONE vertical line and
+   *  every quake the feed reports is drawn on it as a Richter-style trace: a
+   *  dense jitter burst that rises to a spike and eases back down. The pen
+   *  never draws two quakes at once and it never retires - it is the one
+   *  instrument, and the line it rides is the one straight line on the page
+   *  that is not straight.
+   *
+   *  There is no travel down the page and no sweep. The drum is TIME: the burst
+   *  is literally the recent past of the last magnitude the feed reported, so
+   *  what the pen lays down is a live recording rather than an animation of a
+   *  queue. Because the drum is time, a burst can be drawn DIRECTLY onto the
+   *  rail in screen space - there is no world anchor to convert from, and so
+   *  nothing about it can depend on the scroll position. (Every previous
+   *  version anchored the trace in the world and swept it up with the scroll,
+   *  which is what made the effect appear at the top of the page, then at the
+   *  bottom, then only outside the viewport. That whole class of bug is gone
+   *  with the anchor.)
+   *
+   *  The pen hops from line to line every `EQ_HOP_MIN`..`EQ_HOP_MAX` seconds;
+   *  see `eqHopMaterialise` for how a hop is handled.
+   * ================================================================== */
+  const EQ_URL = "https://earthquake.usgs.gov/fdsnws/event/1/query";
+  const EQ_MIN_MAG = 2.5;            // below this the trace is imperceptible
+  const EQ_LOOKBACK_S = 12 * 60 * 60;
+  const EQ_POLL_MS = 60_000;
+  const EQ_FETCH_TIMEOUT_MS = 15_000;
+  const EQ_MAX_MAG = 8.0;            // magnitude whose trace fills the plot
+  // At or above this, a quake sets off a STORM rather than a single burst.
+  // Genuine violent events are common enough in a 12h lookback that this fires
+  // on real data - it is not a special effect reserved for the spacebar.
+  const EQ_STORM_MAG = 5.0;
+  // The pen's own drum: how fast the burst's leading edge sweeps DOWN the rail,
+  // in rows per second. The whole run is EQ_BURST_ROWS / EQ_BURST_PXPS = ~1.8s,
+  // and that number matters much more than it looks. This originally ran at 68
+  // and took ~5s, and because the envelope decays behind the edge the needles
+  // only ever reached **29% down the plot** - so a burst could never touch an
+  // image below the top fifth of the page and nothing was ever torn. The drum
+  // has to sweep the WHOLE plotted line for the piece to read at all.
+  const EQ_BURST_ROWS = 340;
+  const EQ_BURST_PXPS = 190;
+  // How long a burst takes to spend itself, in seconds (the `calm` ramp).
+  const EQ_BURST_LIFE = 8;
+  // One life, and how it is punctuated: the pen relocates to another line no
+  // sooner than EQ_HOP_MIN and no later than EQ_HOP_MAX seconds apart.
+  const EQ_HOP_MIN = 5;
+  const EQ_HOP_MAX = 30;
+  // The pen has to be there before the wave is; see `eqCurve`'s lookahead.
+  const EQ_LEAD = 0.05;
+  // The trace is sampled in ROWS. What has to fit the plot's width is the
+  // sideways spread of its jitter, not its height.
+  const EQ_RAIL = 0.15;              // fraction of the run spent at the spike
+  const EQ_TAU = 0.12;               // dead run drawn before the needles start
+  // Pitch of the base needle, in rows. The needles ARE the seismogram, so this
+  // is the single most visible constant: ~19 rows over a 340-row run gives ~17
+  // needles, which reads as a dense spiky trace rather than a slow wobble.
+  const EQ_NEEDLE_W = 19;
+  // The peak of `rise * fall` at q = EQ_RAIL, i.e. sqrt(EQ_RAIL) * (1 - EQ_RAIL).
+  // The envelope is divided by this so the burst's widest point is full height;
+  // without it the two ratios multiply to 0.35 and the trace comes out flat.
+  const EQ_SHAPE_PEAK =
+    Math.sqrt(EQ_RAIL) * (1 - EQ_RAIL);
+  // Rows down the trace. The plot is only a few hundred px tall, so this is
+  // already sub-pixel; going higher just builds path segments that can never
+  // be seen.
+  const EQ_COLS = 512;
+
+  /* --- the pen ----------------------------------------------------------- *
+   * There is exactly one, for the whole life of the page. It has:
+   *   `qx`      the line it currently rides, as a fraction of plotW 0..1
+   *   `hopAt`   the second at which it relocates to another line
+   *   `waveT`   the second at which the last quake arrived (the burst origin)
+   *   `mag`     the magnitude of that quake
+   * `nowS` is page time in seconds, the single clock everything reads.
+   * ---------------------------------------------------------------------- */
+  let nowS = 0;
+  const pen = { qx: 0.5, hopAt: 0, waveT: -1e9, mag: 0 };
+  let eqHops = 0, eqLast = null;
+  let eqFetched = false, eqCount = 0, eqMax = 0, eqErr = "";
+  let railX = 0;
+
+  // Debug: the rail's exact geometry this frame - the pen's straight line x and
+  // the trace's x at each plotted row. Lets a test read the SHAPE of the line
+  // without pixel-scanning. Returns xCss = null where the line is straight.
+  window.__rail = () => {
+    const rows = [];
+    for (let k = 0; k <= 40; k++) {
+      const y = PAD.top + plotH * (k / 40);
+      rows.push([+y.toFixed(1), seismoX(y)]);
+    }
+    return { railX: +railX.toFixed(2), qx: +pen.qx.toFixed(3),
+             plotW: +plotW.toFixed(1), peak: eqGeom ? +eqGeom.peak.toFixed(3) : null,
+             rows };
+  };
+
+  // Live status, readable from the console: window.__quakes()
+  window.__quakes = () => ({
+    fetched: eqFetched, count: eqCount, max: eqMax, err: eqErr,
+    mag: eqLast ? +eqLast.mag.toFixed(2) : null,   // the magnitude just drawn
+    rail: +railX.toFixed(1),
+    hopIn: +(pen.hopAt - nowS).toFixed(1),         // seconds until it moves line
+    hops: eqHops,
+    storm: nowS < stormUntil,                      // mid-storm this frame?
+    stormLeft: +(stormUntil - nowS).toFixed(2),
+    burstAge: pen.waveT < 0 ? null : +(nowS - pen.waveT).toFixed(1),
+  });
+
+  // A fresh landing, on a line away from the one just used. Coming down on a
+  // line that has only just been swept reads as a stutter rather than a
+  // relocation - two bursts on the same rail - so the target is re-rolled until
+  // it is clear. It must be a RE-ROLL and not a "skip the move": skipping would
+  // leave `hopAt` already elapsed, so the pen would try again on the very next
+  // frame and the burst would jitter in place instead of ever relocating.
+  function eqHopMaterialise() {
+    let want = pen.qx;
+    for (let i = 0; i < 12 && Math.abs(want - pen.qx) < 0.14; i++) {
+      want = 0.10 + Math.random() * 0.80;          // keep it inside the plot
+    }
+    pen.qx = want;
+    pen.hopAt = nowS + EQ_HOP_MIN + Math.random() * (EQ_HOP_MAX - EQ_HOP_MIN);
+    eqHops++;
+  }
+
+  /* --- THE STORM ---------------------------------------------------------- *
+   * A new quake does not just start a burst: for a moment the instrument is
+   * overwhelmed. The pen is thrown from line to line several times a second, and
+   * the trace is driven far past its normal amplitude, so the page is crossed by
+   * needles from several lines at once before it settles back onto one.
+   *
+   * This does NOT introduce extra pens - it is the same single line, moving very
+   * fast, exactly as the user asked ("one life" preserved). What the pictures see
+   * is needles arriving from many directions, which is the point.
+   * ---------------------------------------------------------------------- */
+  let stormAt = -1e9, stormUntil = -1e9, stormX = [];
+  const STORM_JUMP_S = 0.22;         // how long the pen holds each line
+  // A storm is mostly MORE NEEDLES, not merely taller ones. Driving only the
+  // amplitude gives needles so long they read as horizontal bars, which is the
+  // opposite of the spiky trace this has to be - the user has been explicit
+  // about that ("No waves! only spikes! spikier!"). Doubling the needle density
+  // and adding a more modest amount of reach reads as violent AND spiky.
+  const STORM_GAIN = 1.30;           // needle reach multiplier at the peak
+  const STORM_FREQ = 2.0;            // needle density multiplier at the peak
+  // The needle pitch the curve is drawn at THIS frame; a storm tightens it.
+  let needleW = EQ_NEEDLE_W;
+
+  function eqStorm(mag) {
+    const n = 4 + Math.floor(Math.random() * 4);   // 4..7 lines in one storm
+    stormX = [];
+    let prev = pen.qx;
+    for (let i = 0; i < n; i++) {
+      let want = prev;
+      for (let t = 0; t < 12 && Math.abs(want - prev) < 0.22; t++) {
+        want = 0.03 + Math.random() * 0.94;
+      }
+      stormX.push(want);
+      prev = want;
+    }
+    stormAt = nowS;
+    stormUntil = nowS + STORM_JUMP_S * n;
+    pen.waveT = nowS;
+    pen.mag = mag;
+    // The pen only chooses its own line again once the storm is over.
+    pen.hopAt = stormUntil + EQ_HOP_MIN + Math.random() * (EQ_HOP_MAX - EQ_HOP_MIN);
+  }
+
+  // One entry point for a quake, whether it came from the feed or the keyboard,
+  // so a faked event is indistinguishable from a real one.
+  function fireQuake(mag) {
+    eqLast = { mag };
+    sendQuakeMidi(mag);
+    if (mag >= EQ_STORM_MAG) eqStorm(mag);
+    else { pen.mag = mag; pen.waveT = nowS; }
+  }
+
+  // 0 at the magnitude floor, 1 at EQ_MAX_MAG.
+  const normMag = (mag) =>
+    Math.max(0, Math.min(1, (mag - EQ_MIN_MAG) / (EQ_MAX_MAG - EQ_MIN_MAG)));
+
+  /* ================================================================== *
+   *  MIDI OUT — one short note per quake, out the IAC bus
+   *
+   *  The piece runs in a browser, so the bridge to whatever else is on the
+   *  machine (a DAW, SuperCollider, Max, a synth) is the Web MIDI API. On
+   *  macOS the standard inter-application port is the IAC Driver; this looks
+   *  for the output whose name looks like "IAC ... 1" (Bus 1) and falls back
+   *  to any IAC port, then to the first output it finds.
+   *
+   *  Web MIDI requires a user gesture, so nothing happens until the first
+   *  click/keypress (see `unblock`). If it is not enabled, this is silent and
+   *  the page is unaffected.
+   * ================================================================== */
+  let midiOut = null, midiName = "", midiTried = false;
+  let midiDirty = false;             // a note is out; a clean is owed when it clears
+  async function initMidi() {
+    if (midiTried) return;
+    midiTried = true;
+    if (!navigator.requestMIDIAccess) {
+      console.warn("MIDI: Web MIDI not supported here (needs https or localhost)");
+      return;
+    }
+    try {
+      const access = await navigator.requestMIDIAccess();
+      const outs = [...access.outputs.values()];
+      midiOut =
+        outs.find(o => /iac/i.test(o.name) && /1\b/.test(o.name)) ||
+        outs.find(o => /iac/i.test(o.name)) ||
+        outs[0] || null;
+      midiName = midiOut ? midiOut.name : "";
+      if (midiOut) console.log("MIDI out:", midiName);
+      else console.warn("MIDI: no output ports (enable IAC Driver in Audio MIDI Setup)");
+    } catch (e) {
+      console.warn("MIDI: access failed:", e);
+    }
+  }
+
+  // One note per quake: magnitude maps to PITCH (bigger quake, higher note) and
+  // a storm (>= EQ_STORM_MAG) hits with more VELOCITY than a lone burst.
+  function sendQuakeMidi(mag) {
+    if (!midiOut) return;
+    const n = Math.max(0, Math.min(1, (mag - EQ_MIN_MAG) / (EQ_MAX_MAG - EQ_MIN_MAG)));
+    const note = 36 + Math.round(n * 60);        // 36 (floor) .. 96 (mag 8)
+    const vel = mag >= EQ_STORM_MAG ? 110 : 70;
+    try {
+      midiOut.send([0x90, note, vel]);           // note on, channel 1
+      midiDirty = true;                          // owe a clean when this clears
+      // release shortly after, so a downstream synth does not latch the note
+      setTimeout(() => { try { midiOut.send([0x80, note, 0]); } catch (e) {} }, 250);
+    } catch (e) { /* port vanished mid-flight - ignore */ }
+  }
+
+  // THE CLEAN. When a burst has fully cleared, a panic goes out on EVERY channel
+  // so the receiving device is left silent and neutral: sustain off, all sound
+  // off, all notes off, controllers reset, and pitch-bend centred. Without this
+  // a synth can be left ringing, holding a sustain, or sitting on a bent pitch
+  // from the note we sent at the quake. This is the "clean" signal.
+  function sendMidiClean() {
+    if (!midiOut) return;
+    try {
+      for (let ch = 0; ch < 16; ch++) {
+        midiOut.send([0xB0 | ch, 64, 0]);      // sustain pedal off
+        midiOut.send([0xB0 | ch, 120, 0]);     // all sound off (silence now)
+        midiOut.send([0xB0 | ch, 123, 0]);     // all notes off
+        midiOut.send([0xB0 | ch, 121, 0]);     // reset all controllers
+        midiOut.send([0xE0 | ch, 0x00, 0x40]); // pitch bend to centre
+      }
+    } catch (e) { /* port vanished mid-flight - ignore */ }
+  }
+
+  // Live status / manual (re)scan: window.__midi() and window.__midiScan()
+  window.__midi = () => ({ ready: !!midiOut, name: midiName, tried: midiTried, dirty: midiDirty });
+  window.__midiScan = async () => {
+    midiTried = false; midiOut = null;
+    await initMidi();
+    return window.__midi();
+  };
+  window.__midiClean = () => { midiDirty = false; sendMidiClean(); return true; };
+
+  /* Ask the feed for the last quake and hand it to the pen.
+   *
+   * It used to build an endless queue (each quake re-armed below the plot the
+   * moment it cleared) and let several traces live at once. The pen is one life
+   * now, so all that is needed is the SINGLE most recent event: the trace is a
+   * live recording of that magnitude, not an animation of a queue. `orderby`
+   * is `time-desc` to make "most recent" explicit rather than an assumption
+   * about the API's default ordering.
+   *
+   * A quake the pen has already drawn is not re-drawn, so each fetch does at
+   * most one thing - EXCEPT the first, which always arms a burst so the piece
+   * does not open silent while waiting for the next earthquake on Earth. */
+  let lastQuakeId = null;
+  async function fetchQuakes() {
+    const since = new Date(Date.now() - EQ_LOOKBACK_S * 1000)
+      .toISOString().slice(0, 19);
+    // `orderby=time-desc` is NOT a valid value - the endpoint answers 400 and
+    // the whole feed silently dies. Only `time` and `magnitude` are accepted, so
+    // the newest event is picked by comparing the `time` property rather than by
+    // relying on the server's ordering.
+    const url = EQ_URL + "?" + new URLSearchParams({
+      starttime: since,
+      minmagnitude: String(EQ_MIN_MAG),
+      format: "geojson",
+      orderby: "time",
+    });
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), EQ_FETCH_TIMEOUT_MS);
+    try {
+      const resp = await fetch(url, { signal: ctrl.signal });
+      if (resp.status === 204) { eqFetched = true; eqCount = 0; return; }
+      const data = await resp.json();
+      const feats = (data && data.features) || [];
+      eqFetched = true;
+      eqErr = "";
+      eqCount = feats.length;
+      eqMax = feats.reduce((a, f) => {
+        const m = Number((f.properties || {}).mag);
+        return isFinite(m) && m > a ? m : a;
+      }, 0);
+
+      let newest = null, newestT = -Infinity;
+      for (const f of feats) {
+        const p = (f && f.properties) || {};
+        const mag = Number(p.mag);
+        const tt = Number(p.time);
+        if (!isFinite(mag) || !isFinite(tt)) continue;
+        if (tt > newestT) { newestT = tt; newest = f; }
+      }
+      if (!newest) return;
+      const p = (newest.properties) || {};
+      const id = String(newest.id || p.code || newestT);
+      // A quake the pen has drawn is not drawn twice.
+      if (id === lastQuakeId) return;
+      lastQuakeId = id;
+      // A quake is drawn once. Route it through `fireQuake` so a real event and
+      // the spacebar control take exactly the same path.
+      fireQuake(Number(p.mag));
+    } catch (err) {
+      // offline or blocked - the pen keeps its last reading
+      eqErr = String((err && err.message) || err);
+    } finally {
+      clearTimeout(t);
+    }
+  }
+
+  /* --- the continuous trace ---------------------------------------------- *
+   * ONE life means there is no threshold at which a trace "appears" - the line
+   * is the pen, permanently, and a burst is something that travels down it.
+   *
+   * `r` is how far down the rail a given row is, in the pen's own burst frame:
+   * r = 0 is the very top of the plot and r grows downward. The burst originates
+   * at r = 0 and its envelope travels outward at EQ_BURST_PXPS, so at time `age`
+   * the leading edge sits at `age * EQ_BURST_PXPS` rows. Everything below it has
+   * not been reached; everything above it has been drawn and is settling, and
+   * the `fall` term is what returns it to a dead straight line.
+   *
+   * The waveform is read from a FIXED row, not from the moving edge, so each
+   * needle is laid down once exactly as a drum records: it does not stretch as
+   * the edge advances. `EQ_LEAD` gives the pen a little lookahead so the needles
+   * are already drawn in as the edge sweeps past them.
+   *
+   * Returns exactly 0 when there is nothing to draw, so the line is PERFECTLY
+   * STRAIGHT both before the first quake and after a burst has spent itself. */
+  function eqCurve(r, age) {
+    if (age < 0 || age > 40) return 0;             // nothing recent / long gone
+    const edge = age * EQ_BURST_PXPS;
+    const s = r / edge + EQ_LEAD;                  // 0 at the head, 1 at the edge
+    if (s <= 0 || s >= 1) return 0;                // not reached, or never lands
+    // The burst spends itself as it ages, so the whole thing winds down to
+    // nothing rather than snapping off. It is computed FIRST because BOTH
+    // branches below must use it (see the dead-run note).
+    const calm = Math.max(0, 1 - age / EQ_BURST_LIFE);
+    // The dead run: a small deflection that leads the needles in, for the first
+    // EQ_TAU of the run.
+    //
+    // THIS BRANCH USED TO `return` WITHOUT `calm`, AND THAT WAS THE BUG. Its
+    // 0.12 * peak deflection (a bend of ~11px at a mag-4.5) never decayed, so a
+    // little bend stayed on the line long after the quake was over - "remains
+    // after the earthquakes". Worse, the dead run sits at the very top of the
+    // run (s just below EQ_TAU, i.e. the plot's top rows), so it landed on the
+    // SAME rows every time and every new quake redrew the identical bend -
+    // "triggers the effect afterwards". Scaling it by `calm` like the needles
+    // lets it wind down to a dead-straight line with the rest of the burst.
+    const dead = Math.min(s / EQ_TAU, 1);
+    if (s < EQ_TAU) return 0.12 * dead * calm;
+    const q = (s - EQ_TAU) / (1 - EQ_TAU);
+    const envPeak = Math.max(0.10, 1 - s);
+    const rise = Math.pow(Math.min(q / EQ_RAIL, 1), 0.50);
+    const fall = Math.pow(Math.max(0, 1 - (q - EQ_RAIL) / (1 - EQ_RAIL)), 0.95);
+    // The shape of the whole burst, normalised so its widest point is 1. The
+    // envelope is NOT allowed to approach 0 anywhere in the middle: `rise` and
+    // `fall` are ratios and cross at q = EQ_RAIL, where they only reach
+    // sqrt(EQ_RAIL) = 0.39 and 0.78. Multiplying them straight in therefore ate
+    // the peak - the trace measured 0.35 of full height, and the sharpest thing
+    // on it was the flat `dead` run rather than the needles.
+    const shape = rise * fall;
+    const env = shape / EQ_SHAPE_PEAK;
+
+    // SPIKES, not waves. A sum of sines is a swell; what a pen lays down is a
+    // baseline with needles jumping off it in both directions, so the signal is
+    // a few incommensurate rates of one NARROW feature: |sin| raised to a high
+    // power is a needle with dead space either side, and the sign of the sine
+    // makes successive needles flip sides. The exponent IS the sharpness - a low
+    // one is exactly the rounded wave this must not be.
+    //
+    // `T` is in RADIANS per row, so the pitch of the base needle is
+    // `2*PI/EQ_NEEDLE_W` = ~19 rows and a 340-row run carries ~17 of them -
+    // which is what reads as a seismogram. A rate of 0.055 gave a pitch of 114
+    // rows and only three needles, i.e. a slow wobble.
+    const T = r * (2 * Math.PI / needleW);
+    const nd = (t, E) => Math.sign(Math.sin(t)) * Math.pow(Math.abs(Math.sin(t)), E);
+    // The weights make one rate dominant, so tall needles stand clear of the
+    // fine ones instead of fuzzing into a band. The gain is set against a
+    // MEASUREMENT of this signal, not a guess: normalising the envelope to 1
+    // puts the raw needle sum's widest moment at ~1.32, so 0.50 holds the trace
+    // at about full scale. Run it much hotter and the needles stop reading as a
+    // seismograph and become long horizontal bars that also hide the pictures
+    // behind them.
+    let j = (nd(T, 30) * 0.92
+           + nd(T * 1.73 + 1.1, 36) * 0.52
+           + nd(T * 2.90 + 2.3, 44) * 0.26) * 0.50;
+    // a height wobble that never changes sign: it varies how tall the needles
+    // are without ever itself looking like a wave
+    j *= 0.45 + 0.55 * Math.abs(Math.sin(T * 0.13 + 0.5));
+    if (q < EQ_RAIL) j += nd(T * 5.7 + 0.4, 54) * 0.55 * (1 - q / EQ_RAIL);
+    return j * env * envPeak * calm;
+  }
+
+  /* The rail's geometry for THIS frame, worked out once in `eqFrame`. Every
+   * consumer - the stroked rail, the card drag, the bend and the pull - reads
+   * this one object, so none of them can disagree about where the spike is. */
+  let eqGeom = null;
+  const EQ_LUT = 1024;
+  const penLut = new Float32Array(EQ_LUT + 1);   // pen offset down the rail
+
+  // Worked out once per frame. The pen curve is baked into a lookup table here,
+  // so asking for the pen's offset at a row is a linear interpolation rather
+  // than three sine terms - the cards ask hundreds of times per frame.
+  function eqFrame(tSec) {
+    // Page time comes from the real clock, NOT from the frame delta. The delta
+    // is clamped to 50ms so a stall cannot teleport the scroll, but on a slow
+    // machine (10fps = 100ms frames) that clamp makes `nowS` run at half speed -
+    // and it would silently stretch the 5-30s hop window to 10-60s. Wall clock
+    // keeps the interval honest whatever the frame rate.
+    nowS = tSec;
+    // During a storm the pen is thrown from line to line several times a second.
+    if (nowS < stormUntil) {
+      const i = Math.min(stormX.length - 1, Math.floor((nowS - stormAt) / STORM_JUMP_S));
+      pen.qx = stormX[i];
+    } else if (nowS >= pen.hopAt) {
+      eqHopMaterialise();
+    }
+    railX = PAD.left + plotW * pen.qx;
+
+    // `peak` is fixed for the life of a burst, so the bend on the cards does not
+    // shimmer as the envelope decays. The storm drives it far past normal for a
+    // moment and then winds back to 1, which is what makes the first seconds
+    // violent rather than merely busy.
+    const age = nowS - pen.waveT;
+    // THE CLEAN, at the moment the effect is fully gone. A burst is spent when
+    // `age >= EQ_BURST_LIFE` (the `calm` ramp) and the storm ramp has finished;
+    // `EQ_BURST_LIFE` is the binding one (the storm ramp is ~2-3s). Only when a
+    // note was actually sent (`midiDirty`) do we owe a clean.
+    if (midiDirty && age >= EQ_BURST_LIFE) { midiDirty = false; sendMidiClean(); }
+    const stormT = nowS < stormUntil
+      ? 1 : Math.max(0, 1 - (nowS - stormUntil) / 1.2);
+    const gain = 1 + (STORM_GAIN - 1) * stormT;
+    needleW = EQ_NEEDLE_W / (1 + (STORM_FREQ - 1) * stormT);
+    const peak = eqPeakFor(normMag(pen.mag)) * gain;
+    eqGeom = { peak };
+    for (let i = 0; i <= EQ_LUT; i++) {
+      penLut[i] = eqCurve(i / EQ_LUT * EQ_BURST_ROWS, age) * gain;
+    }
+  }
+
+  // Pen offset at screen row y, as a fraction of the peak, or null when the line
+  // is straight there.
+  function seismoSample(y) {
+    if (!eqGeom) return null;
+    const r = (y - PAD.top) / plotH * EQ_BURST_ROWS;
+    if (r < 0 || r > EQ_BURST_ROWS) return null;
+    const fi = r / EQ_BURST_ROWS * EQ_LUT;
+    const i0 = Math.min(EQ_LUT, fi | 0);
+    const i1 = i0 >= EQ_LUT ? EQ_LUT : i0 + 1;
+    const v = penLut[i0] + (penLut[i1] - penLut[i0]) * (fi - i0);
+    return v === 0 ? null : v;
+  }
+
+  // Screen x of the pen at screen row y, or null where the line is straight.
+  function seismoX(y) {
+    const v = seismoSample(y);
+    return v === null ? null : railX + v * eqGeom.peak;
+  }
+
+  /* --- NO TEARING, EVER ---------------------------------------------- *
+   * There USED to be a `ripHits`/`ripClip` pair here: when the trace crossed a
+   * picture, a chunk of it was clipped away along the pen path so the spike
+   * became the picture's border.
+   *
+   * IT IS DELETED, and it must not come back in this form. Two reasons, both
+   * seen on screen:
+   *   1. A clip HIDES PART OF A PICTURE, and the user's rule is absolute: no
+   *      image may ever disappear or be eaten out of the viewable area ("I do
+   *      not want any images to disappear"). The very first version closed its
+   *      polygon at +/-infinity, which erased whole pictures outright.
+   *   2. Even bounded to a strip along one edge - the last version, capped at
+   *      `ripDepth` of the width - it degenerates on a FULL-WIDTH card. A video
+   *      band spans the plot, so the mean pen x lands near its centre, the
+   *      clamped path saturates against one edge for most rows, and the "tear"
+   *      reads as a clean rectangular bite out of the band. Straight, hard,
+   *      obviously a subtraction - not a rip. That is the artefact the user
+   *      photographed.
+   *
+   * A picture is now ALWAYS drawn as one whole piece. Anything that removes
+   * pixels from a card - clip, mask, wipe, subtract - reintroduces exactly the
+   * complaint. The quake shows itself through the BEND alone, which moves and
+   * shears the whole picture but never hides any of it.
+   * ---------------------------------------------------------------------- */
+
+  /* The seismogram: the one line the pen rides, rewritten as the trace. It is
+   * the only straight line on the page that is not straight. */
+  function eqSeismoRail() {
+    if (!eqGeom) return;
+    ctx.lineWidth = 1.8;
+    ctx.beginPath();
+    for (let i = 0; i <= EQ_COLS; i++) {
+      const y = PAD.top + plotH * (i / EQ_COLS);
+      const px = seismoX(y);
+      const x = px === null ? railX : px;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    ctx.lineWidth = 1;
+  }
+
+  // Sideways swing of the trace's burst, in px. It is scaled to the plot's
+  // WIDTH, because the trace now runs vertically: the swing is what has to fit
+  // across the page, not the run down it. The lookahead in `seismoX` means the
+  // spike lands at railX + peak, so this is also exactly how far a drawn card
+  // strays from the rail - the pull radius has to stay inside it.
+  // Sideways swing of the trace's burst, in px, for a given normalised
+  // magnitude: how far a FULL-SCALE needle (|curve| = 1) reaches from the rail.
+  // Scaled to the plot's WIDTH, because the trace runs vertically - the swing is
+  // what has to fit across the page, not the run down it. At 0.45 a magnitude-8
+  // quake throws its tallest needles ~36% of the plot width either side of the
+  // rail, and the lookahead in `seismoX` means this is also exactly how far a
+  // drawn card strays from it.
+  const eqPeakFor = (m) => (0.30 + 0.70 * m) * plotW * 0.45;
+
+  // The VERTICAL grid lines are no longer straight: `drawGrid` builds each one
+  // from the shared spike field (see the note there). These two helpers are the
+  // STRAIGHT paths, kept for the horizontal lines (which a quake never moves -
+  // sliding a full-width line sideways just reads as it bobbing) and for the
+  // rigid case when there is no quake or `EQK.grid` is 0.
+  function lineH(by) {
+    ctx.beginPath();
+    ctx.moveTo(PAD.left - 2, by);
+    ctx.lineTo(PAD.left + plotW + 2, by);
+    ctx.stroke();
+  }
+  function lineV(bx) {
+    ctx.beginPath();
+    ctx.moveTo(bx, PAD.top - 2);
+    ctx.lineTo(bx, baseY + 2);
+    ctx.stroke();
+  }
+
+  /* ================================================================== *
+   *  Draw the cards.
+   *
+   *  A card the quake does not reach is a plain `drawImage` — no transform, no
+   *  mesh, nothing. A card the quake DOES reach is torn and stretched in place
+   *  by `drawTornCard` (see the tear note). Neither case moves the picture: a
+   *  card always occupies exactly its own box on the page.
+   * ================================================================== */
+
+  function drawCards(videoOnly) {
+    ctx.save();
+    ctx.beginPath();
+    // PICTURES LIVE ON THE PLOT AND NOWHERE ELSE. The clip is the plot RECT
+    // itself - `(PAD.left, PAD.top, plotW, plotH)` - and it is NEVER opened.
+    // The bottom edge is the horizontal axis at `baseY`, the left edge is the
+    // vertical axis that keeps the row labels clear.
+    //
+    // Spilling is BETWEEN pictures, not out of the graph: a hit band may fray
+    // past its OWN card border and onto its neighbours, but the whole set is
+    // still scissored to the plot, so nothing a quake does can ever leave the
+    // graphed area. That guarantee is structural, exactly as before.
+    ctx.rect(PAD.left, PAD.top, plotW, plotH);
+    ctx.clip();
+
+    for (const c of CARDS.values()) {
+      if (!!c.isVideo !== videoOnly) continue;
+      // Video bands are drawn ON TOP of the grid, so they have to be opaque.
+      // Stills over PAPER were `multiply` (printed into the page); over the
+      // BLACK panel `multiply` would erase them to black, so there they are
+      // drawn opaque too. `PLOT_DARK` is the single switch, so this matches
+      // whatever `draw` painted as the plot background.
+      ctx.globalCompositeOperation = (c.isVideo || PLOT_DARK)
+        ? "source-over"
+        : "multiply";
+      let src = null;
+      if (c.isVideo) {
+        // One stream per band, so a screenful shows a screenful of moments.
+        if (c.stream === undefined) assignStream(c);
+        src = paintStream(c.stream) || paintStream(0);
+      } else if (c.prepared) {
+        src = c.tex;
+      }
+      if (!src) continue;
+      const sy = cardScreenTop(c);
+      // Cull well outside the plot. The extra `tileH` above the top is for the
+      // snag, whose lift can carry a card's material past the limit while the
+      // card itself is still just off-screen.
+      if (sy + c.h < PAD.top - tileH || sy > baseY + tileH) continue;
+
+      // A CARD THE QUAKE REACHES IS TORN AND STRETCHED IN PLACE. One mesh pass:
+      // each strip is scissored out of the source at one height and laid into a
+      // band of the destination, so the pixels between the tears stretch. Both
+      // ends of the mapping stay welded to the box, so the picture can be
+      // mangled as hard as the quake likes and can never leave its own bounds.
+      const tear = cardTear(c);
+      if (tear > 0) {
+        drawTornCard(c, src, sy, tear);
+        continue;
+      }
+      ctx.drawImage(src, c.x, sy, c.w, c.h);
+    }
+
+    ctx.restore();
+  }
+
+  /* THE SHREDDER. Draws one card as a stack of horizontal bands, each taken from
+   * its own rows of the source and laid into its own (uneven) rows of the box.
+   *
+   * Per band: stretched vertically by `dst height / src height` (the pixels are
+   * genuinely stretched, not just moved), thrown sideways with WRAP-AROUND, and
+   * optionally smeared (one thin sliver pulled across the whole band) or
+   * mirrored. Every internal edge is snapped to a DEVICE pixel and shared by the
+   * band above and the band below, so the bands tile with no hairline gap and
+   * no overlap - which matters under `multiply`, where an overlap would darken.
+   *
+   * The wrap draws the band twice, a box-width apart, at an integer device
+   * offset so the two copies abut with no seam; the clip is the card's box, so
+   * nothing is ever drawn outside it. */
+  function drawTornCard(c, src, sy, tear) {
+    // Read the SOURCE's own size. A video band's source is a canvas sized to the
+    // plot in device pixels, so the old `naturalWidth || videoWidth || RW` chain
+    // fell through to 200x250 and sampled only a corner of it.
+    const sw = src.width || RW;
+    const sh = src.height || RH;
+    // A video band's source carries a hair of the file's baked-in black edge at
+    // its left and right. A calm band hides it against the plot's border, but a
+    // sideways throw wraps it into the middle of the picture as a black bar, so
+    // the torn path samples slightly inside the frame (a ~1.5% crop each side).
+    const inset = c.isVideo ? Math.max(2, sw * 0.015) : 0;
+    const x0 = c.x, w = c.w;
+    // Each card re-rolls on its own phase, so a screenful does not all flip on
+    // the same frame. `rate` 0 freezes the damage.
+    const epoch = EQK.rate > 0
+      ? Math.floor(nowS * EQK.rate + (c.seed % 97) / 97)
+      : 0;
+    const n = buildBands(c, tear, epoch);
+    // snapped destination edges, in CSS px, shared by neighbouring bands
+    bTop[0] = sy;
+    for (let k = 1; k < n; k++) bTop[k] = Math.round((sy + bD[k] * c.h) * dpr) / dpr;
+    bTop[n] = sy + c.h;
+
+    // SPILL: how far a hit band may bleed past the box, in px. A stopped card
+    // (spill 0) draws exactly its own box as before; a live one can spill hard.
+    const bleedMax = c.w * Math.max(0, EQK.spill) * 2.2;
+    const upPx = c.w * Math.max(0, EQK.spill);
+
+    ctx.save();
+    // A clip that is BIGGER than the card while spilling, exactly the card when
+    // not. Everything below still draws its intact core inside this box; the
+    // bleed is drawn on top and reaches past the edge. The clip is only ever
+    // relaxed, never tightened, so the picture is never cut into.
+    ctx.beginPath();
+    ctx.rect(x0 - bleedMax, sy - bleedMax, w + 2 * bleedMax, c.h + 2 * bleedMax);
+    ctx.clip();
+
+    // PASS 1 - THE INTACT CORE. Every band is drawn at the FULL card width, so
+    // the box is always completely covered by the picture. Nothing here can
+    // erase: the band edges tile 0..1 and a sideways throw is drawn twice and
+    // wraps. This is the whole no-erasure guarantee, and the spill below sits
+    // on top of it, so it can only add material, never remove it.
+    for (let k = 0; k < n; k++) {
+      const yT = bTop[k], yB = bTop[k + 1];
+      const dh = yB - yT;
+      if (dh <= 0) continue;
+      const sT = bS[k] * sh;
+      const sH = (bS[k + 1] - bS[k]) * sh;
+      const smear = (bK[k] & 1) !== 0;
+      const flip = (bK[k] & 2) !== 0;
+      // a smear takes a narrow sliver of the band and pulls it across the box
+      const usable = sw - 2 * inset;
+      const sliceW = smear ? Math.max(2, usable * 0.06) : usable;
+      const sliceX = inset + (smear ? Math.min(usable - sliceW, bSl[k] * usable) : 0);
+      // integer device-pixel shift, wrapped into [0, w)
+      const shift = Math.round((((bDx[k] % w) + w) % w) * dpr) / dpr;
+      if (flip) {
+        ctx.save();
+        ctx.translate(2 * x0 + w, 0);       // mirror about the box's centre line
+        ctx.scale(-1, 1);
+      }
+      ctx.drawImage(src, sliceX, sT, sliceW, sH, x0 + shift, yT, w, dh);
+      if (shift > 0) ctx.drawImage(src, sliceX, sT, sliceW, sH, x0 + shift - w, yT, w, dh);
+      if (flip) ctx.restore();
+    }
+
+    // PASS 2 - THE SPILL (only when the shred is allowed past the border). For
+    // each hit band, the outermost sliver of its own edge pixels is stretched
+    // out sideways in a few tapered spears, so the picture bleeds past its own
+    // border as jagged edges. Nothing is masked and nothing is removed: the
+    // core beneath is untouched and these are simply painted over the edge.
+    if (EQK.spill > 0) {
+      const usable = sw - 2 * inset;
+      for (let k = 0; k < n; k++) {
+        const h = bI[k];
+        if (h < 0.30) continue;
+        const sT = bS[k] * sh;
+        const sH = (bS[k + 1] - bS[k]) * sh;
+        const left = rnd(c.seed, k * 29 + 15, epoch) < 0.5;
+        const nT = 1 + (rnd(c.seed, k * 31 + 17, epoch) * 3 | 0);
+        for (let t = 0; t < nT; t++) {
+          const ta = Math.max(0.12, h - 0.15);
+          const len = bleedMax * ta * (0.35 + rnd(c.seed, k * 37 + t * 5 + 19, epoch) * 0.65);
+          if (len < 1) continue;
+          const xE = left ? x0 : x0 + w;          // the edge the band hangs off
+          const xW = left ? xE - len : xE + len;  // how far it spears outward
+          const yy = sy + (bD[k] + (bD[k + 1] - bD[k]) * rnd(c.seed, k * 41 + t * 3 + 23, epoch)) * c.h;
+          const hh = Math.max(1.5, (bTop[k + 1] - bTop[k]) * (0.25 + rnd(c.seed, k * 43 + t + 29, epoch) * 0.6));
+          ctx.save();
+          ctx.beginPath();
+          ctx.moveTo(xE, yy);
+          ctx.lineTo(xW, yy + hh * (rnd(c.seed, k * 47 + t + 31, epoch) - 0.5));
+          ctx.lineTo(xE, yy + hh);
+          ctx.closePath();
+          ctx.clip();
+          if (left) {
+            ctx.setTransform(-1, 0, 0, 1, 2 * xE, 0);
+            ctx.drawImage(src, inset, sT, 2, sH, xE, yy, len, hh);
+          } else {
+            ctx.drawImage(src, inset + usable - 2, sT, 2, sH, xE, yy, len, hh);
+          }
+          ctx.restore();
+        }
+      }
+      // raise the spilt rows at the very TOP and BOTTOM of the picture, so the
+      // whole frame frays outward and not only at its sides
+      for (let edge = 0; edge < 2; edge++) {
+        const hit = edge === 0 ? bI[0] : bI[n - 1];
+        if (hit < 0.30) continue;
+        const dir = edge === 0 ? -1 : 1;          // up, or down
+        const yE = edge === 0 ? sy : sy + c.h;
+        // sample the real outermost source row: the top 2px for the top edge,
+        // the bottom 2px for the bottom edge
+        const sT = edge === 0 ? bS[0] * sh : Math.max(0, bS[n] * sh - 2);
+        const sH = 2;
+        const nT = 2 + (rnd(c.seed, edge * 53 + 33, epoch) * 3 | 0);
+        for (let t = 0; t < nT; t++) {
+          const ta = Math.max(0.12, hit - 0.15);
+          const len = upPx * ta * (0.35 + rnd(c.seed, edge * 59 + t * 7 + 35, epoch) * 0.65);
+          if (len < 1) continue;
+          const xx = x0 + w * rnd(c.seed, edge * 61 + t * 3 + 37, epoch);
+          const ww = Math.max(1.5, w * (0.02 + rnd(c.seed, edge * 67 + t + 41, epoch) * 0.05));
+          ctx.save();
+          ctx.beginPath();
+          ctx.moveTo(xx, yE);
+          ctx.lineTo(xx + ww * (rnd(c.seed, edge * 71 + t + 43, epoch) - 0.5), yE + dir * len);
+          ctx.lineTo(xx + ww, yE);
+          ctx.closePath();
+          ctx.clip();
+          ctx.setTransform(1, 0, 0, dir, 0, edge === 0 ? 2 * yE : 0);
+          ctx.drawImage(src, inset, sT, usable, 2, xx, yE, ww, len);
+          ctx.restore();
+        }
+      }
+    }
+
+    // THE MARKS. The quake leaves ink where it broke the picture: a jagged dark
+    // crack along the bands that were thrown furthest from their neighbours,
+    // plus a short drag-streak. Only the worst few, so they read as damage and
+    // not as ruled lines (an earlier pass inked every seam and looked like graph
+    // paper). All of it is confined to the card's box.
+    if (EQK.marks > 0) {
+      const picks = Math.min(5, Math.max(2, Math.round(n / 5)));
+      for (let p = 0; p < picks; p++) {
+        let best = -1, bv = 0.0;
+        for (let k = 1; k < n; k++) {
+          if (bPicked[k]) continue;
+          const jump = Math.abs(bDx[k] - bDx[k - 1]) / w + (1 - Math.min(1, bR[k])) * 0.5;
+          if (jump > bv) { bv = jump; best = k; }
+        }
+        if (best < 0 || bv < 0.05) break;
+        bPicked[best] = 1;
+        const y = bTop[best];
+        const e2 = epoch * 31 + best;
+        ctx.strokeStyle = COL.axis;
+        ctx.globalAlpha = Math.min(0.85, 0.45 * EQK.marks);
+        ctx.lineWidth = Math.max(0.8, c.w * 0.006);
+        ctx.beginPath();
+        // The crack runs a little past BOTH ends when spilling, so the ink
+        // reads as the damage breaking out of the frame rather than stopping
+        // politely at it. When spill is 0 it starts and ends exactly at x0/x0+w.
+        const over = bleedMax * 0.55;
+        let x = x0 - over;
+        ctx.moveTo(x, y);
+        while (x < x0 + w + over) {
+          x += 4 + rnd(c.seed, e2, Math.floor((x - x0) / 4)) * 14;
+          const wob = (rnd(c.seed, e2 + 7, Math.floor((x - x0) / 4)) - 0.5) * c.h * 0.05 * EQK.marks;
+          ctx.lineTo(Math.min(x, x0 + w + over), y + wob);
+        }
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+    }
+    ctx.restore();
+  }
+
+  /* ================================================================== *
+   *  Grid
+   * ================================================================== */
+  function drawGrid() {
+    const vMax = VALUE_TICKS[VALUE_TICKS.length - 1];
+    ctx.lineWidth = 1;
+    ctx.font = "12px ui-monospace, Menlo, monospace";
+
+    const vLabels = [], hMajor = [];
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(PAD.left, PAD.top, plotW, plotH);
+    ctx.clip();
+
+    // THE SPIKES PUSH THE GRID. Every vertical line is displaced sideways by
+    // the SAME field the pen trace uses, sampled once here and reused, so the
+    // whole graph ripples in step with the seismogram (`EQK.grid` scales it;
+    // 0 restores a rigid grid). It is a SHARE of the pen's own swing, so the
+    // lines thin out where the trace is tame and fan out on a spike. The field
+    // is one waveform shared by every line (a shear): the columns keep their
+    // spacing and the deformation reads as the graph being shoved, not as each
+    // line wobbling on its own.
+    let gridActive = false;
+    if (eqGeom && EQK.grid > 0) {
+      for (let i = 0; i <= EQ_GRID_N; i++) {
+        const v = seismoSample(PAD.top + plotH * i / EQ_GRID_N);
+        const s = v === null ? 0 : v * eqGeom.peak * EQK.grid;
+        gridShift[i] = s;
+        if (s !== 0) gridActive = true;
+      }
+    } else {
+      gridShift.fill(0);
+    }
+
+    for (let v = 0; v <= vMax; v += 20) {
+      const bx = baseX + (v / vMax) * amp;
+      if (bx > baseX + plotW + 1) continue;
+      const major = v % 100 === 0;
+      ctx.strokeStyle = major ? COL.gridMajor : COL.gridMinor;
+      // The rail is one of these vertical lines; it is redrawn as the trace in
+      // `drawSeismo`, so leave it straight here (it carries the FULL swing).
+      if (!(eqGeom && Math.abs(bx - railX) < 0.5)) {
+        if (!gridActive) {
+          lineV(bx);
+        } else {
+          // the line takes the shared field, added to its own base x
+          ctx.beginPath();
+          for (let i = 0; i <= EQ_GRID_N; i++) {
+            const y = PAD.top + plotH * i / EQ_GRID_N;
+            const x = bx + gridShift[i];
+            if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+          }
+          ctx.stroke();
+        }
+      }
+      if (major) vLabels.push([v, bx]);
+    }
+
+    const stepPx = MAJOR_UNITS * pxPerUnit;
+    const minorPx = MINOR_UNITS * pxPerUnit;
+
+    // The horizontal lines stay dead straight. Shifting a full-width line
+    // sideways is not a deformation at all - it just reads as the whole line
+    // bobbing up and down - so the quake shows itself on the ONE vertical
+    // rail, not by rippling the graph.
+    ctx.strokeStyle = COL.gridMinor;
+    let first = Math.floor((offset - PAD.top) / minorPx) * minorPx;
+    for (let wy = first; wy < offset + plotH + minorPx; wy += minorPx) {
+      const sy = PAD.top + wy - offset;
+      if (sy < PAD.top - 2 || sy > baseY + 2) continue;
+      lineH(sy);
+    }
+
+    first = Math.floor((offset - PAD.top) / stepPx) * stepPx;
+    for (let wy = first; wy < offset + plotH + stepPx; wy += stepPx) {
+      const sy = PAD.top + wy - offset;
+      if (sy < PAD.top - 2 || sy > baseY + 2) continue;
+      ctx.strokeStyle = COL.gridMajor;
+      lineH(sy);
+      hMajor.push([Math.round(wy / pxPerUnit), sy]);
+    }
+
+    ctx.strokeStyle = COL.axis;
+    ctx.lineWidth = 1.6;
+    lineV(PAD.left);
+    ctx.beginPath();
+    ctx.moveTo(PAD.left - 2, baseY);
+    ctx.lineTo(PAD.left + plotW + 2, baseY);
+    ctx.stroke();
+    ctx.lineWidth = 1;
+    ctx.restore();
+
+    ctx.fillStyle = COL.label;
+    for (const [v, bx] of vLabels) strokeText(String(v), bx, baseY + 20, "center");
+    for (const [val, sy] of hMajor) strokeText(String(val), PAD.left - 14, sy, "right");
+  }
+
+  // The seismogram is a VERTICAL line: it is the trace the quake is drawn as,
+  // and the one thing on the page that keeps moving when everything else is
+  // pinned in place.
+  function drawSeismo() {
+    if (!eqGeom) return;
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(PAD.left, PAD.top, plotW, plotH);
+    ctx.clip();
+    ctx.strokeStyle = COL.axis;
+    eqSeismoRail();
+    ctx.restore();
+  }
+
+  const COL = {
+    paper: "#f6f5f2",
+    // THE GRAPH'S BOUNDING AREA. The plot rect `(PAD.left, PAD.top, plotW,
+    // plotH)` is painted in this before anything else, so the graphed area
+    // reads as a black panel with the paper showing only in the margins.
+    // The grid and axis colours below are the light set, chosen to read on it.
+    plotBg: "#000000",
+    gridMinor: "#262626",
+    gridMajor: "#3a3a3a",
+    axis: "#d8d7d2",
+    // Labels are drawn OUTSIDE the plot (value labels below `baseY`, row labels
+    // left of the axis), on the paper, so they stay dark. Only the axis/grid/ink
+    // live on the black panel and are light.
+    label: "#6a6a6a",
+    // How a still is blended into the plot. On paper it was `multiply` (printed
+    // into the page); on the black panel `multiply` would erase it to black, so
+    // it is drawn opaque. `PLOT_DARK` is the single switch that flips both.
+    stillBlendDark: "source-over",
+    stillBlendPaper: "multiply",
+  };
+  // The one switch: is the graph's bounding area dark? It flips the still blend
+  // mode (see `drawCards`) so pictures stay visible instead of multiplying to
+  // black. Set it to `false` to go back to the paper look.
+  const PLOT_DARK = true;
+  function strokeText(txt, x, y, align) {
+    ctx.textAlign = align;
+    ctx.textBaseline = "middle";
+    ctx.fillText(txt, x, y);
+  }
+
+  /* ================================================================== *
+   *  Scroll state (vertical, downward, infinite)
+   *
+   *  There is NO manual scrolling - no drag, no wheel. The piece is an
+   *  installation: it advances on its own at a constant crawl and the viewer
+   *  only ever watches it. Removing the drag handlers also removes the
+   *  `dragging`/`idle` gating from every frame and lets the auto-scroll run
+   *  unconditionally, which is both simpler and marginally cheaper.
+   * ================================================================== */
+  let offset = 0;
+  const autoSpeed = 95;                // world px per second
+
+  window.addEventListener("resize", layout);
+
+  // Browsers may refuse to autoplay until the page has been interacted with, so
+  // the streams are nudged on the first gesture. This is NOT a drag handler -
+  // it only exists to unblock playback, and removes itself once it has fired.
+  // The same first gesture also satisfies Web MIDI's user-activation
+  // requirement, so it is where `initMidi` is armed.
+  const unblock = () => { tryPlay(); initMidi(); window.removeEventListener("pointerdown", unblock); };
+  window.addEventListener("pointerdown", unblock, { once: true });
+  window.addEventListener("keydown", () => initMidi(), { once: true });
+
+  /* ================================================================== *
+   *  Frame
+   * ================================================================== */
+  // PERF DIAGNOSTIC (kept: it is the fastest way to tell a GPU-bound slowdown
+  // from a code-bound one). Open the console and run:
+  //     await __fps()     // -> frames per second over 2s (the real number)
+  //     __prof()          // -> per-phase JS ms + canvas/dpr/stream state
+  // If the phase times are all well under 1ms yet __fps() is low, the machine is
+  // GPU-bound (canvas fill / video compositing), NOT limited by the code — the
+  // levers for that are MAX_CANVAS_PX (below) and N_STREAM (top of file).
+  const PROF = {};
+  let _phaseT = 0;
+  function phStart() { _phaseT = performance.now(); }
+  function phEnd(name) {
+    const n = performance.now();
+    const p = PROF[name] || (PROF[name] = { n: 0, sum: 0 });
+    p.n++; p.sum += n - _phaseT;
+    _phaseT = n;
+  }
+  window.__prof = () => {
+    const phases = {};
+    for (const k in PROF) phases[k] = +(PROF[k].sum / PROF[k].n).toFixed(3);
+    const c = canvas;
+    return {
+      phases,                                   // avg JS ms per phase per frame
+      canvasDev: c.width + "x" + c.height,
+      canvasCss: c.clientWidth + "x" + c.clientHeight,
+      devicePixelRatio: window.devicePixelRatio,
+      effectiveDpr: +(c.width / Math.max(1, c.clientWidth)).toFixed(3),
+      bitmapMpx: +(c.width * c.height / 1e6).toFixed(2),
+      maxCanvasPx: MAX_CANVAS_PX,
+      streams: streams.map(v => ({ ready: v.readyState, w: v.videoWidth, h: v.videoHeight })),
+    };
+  };
+  window.__profReset = () => { for (const k in PROF) delete PROF[k]; };
+  window.__fps = (ms = 2000) => new Promise(res => {
+    let n = 0; const t0 = performance.now();
+    (function f() { n++; if (performance.now() - t0 < ms) requestAnimationFrame(f); else res(+(n / ((performance.now() - t0) / 1000)).toFixed(1)); })();
+  });
+
+  function draw(tSec) {
+    phStart();
+    // No `clearRect`: these fills are OPAQUE and cover the whole canvas, so
+    // clearing first is one wasted full-canvas pass every frame - which is
+    // real at a large backing store. Paper first, then the black plot panel
+    // on top of it, exactly as before.
+    ctx.fillStyle = COL.paper;
+    ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = COL.plotBg;
+    ctx.fillRect(PAD.left, PAD.top, plotW, plotH);
+    phEnd("clear");
+
+    const topWorld = offset - PAD.top;
+    ensureCards(topWorld, topWorld + plotH + tileH);
+    frameUnix = tSec * 1000;
+    // Stills stay UNDER the grid. The video bands go OVER it, so the graph's
+    // lines never cross the footage. The seismogram is drawn LAST, over
+    // everything: a band is a full-width opaque screenful, so with the trace
+    // underneath them it vanished wherever a band was showing.
+    //
+    // The quake no longer translates a picture, so there is only ever ONE pass
+    // per kind: nothing has to be redrawn outside the plot's clip.
+    phEnd("setup");
+    drawCards(false);
+    phEnd("stills");
+    // Advance the pen: the grid, the band warp and the trace itself all read
+    // this frame's rail and envelope.
+    eqFrame(tSec);
+    phEnd("eqFrame");
+    drawGrid();
+    phEnd("grid");
+    drawCards(true);
+    phEnd("video");
+    drawSeismo();
+    phEnd("seismo");
+  }
+
+  let prev = performance.now();
+  let frameCount = 0;
+  function tick(now) {
+    const dt = Math.min(0.05, (now - prev) / 1000);
+    prev = now;
+    offset += autoSpeed * dt;
+
+    draw(now / 1000);
+
+    frameCount++;
+    if (frameCount % 2 === 0) {          // remove every other frame (strobe)
+      const topWorld = offset - PAD.top;
+      for (const c of CARDS.values()) {
+        if (c.isVideo) continue;             // video comes from its stream
+        if (c.prepared || c.failed) continue;
+        if (c.worldY > topWorld + plotH + tileH) continue;
+        if (c.worldY + c.h < topWorld - tileH) continue;
+        prepareCard(c);
+      }
+    }
+    requestAnimationFrame(tick);
+  }
+
+  // One life means the piece does not open silent while it waits for the next
+  // earthquake on Earth: arm an opening burst at a mid magnitude right away, and
+  // let the first real quake replace it when the feed answers. The clock is the
+  // same one `eqFrame` uses, so these line up with it.
+  nowS = performance.now() / 1000;
+  pen.hopAt = nowS + EQ_HOP_MIN + Math.random() * (EQ_HOP_MAX - EQ_HOP_MIN);
+  pen.mag = 4.0;
+  pen.waveT = nowS;
+
+  // SPACEBAR FIRES A FAKE QUAKE. It goes through `fireQuake`, the same entry
+  // point the feed uses, so what you see is exactly what a real event produces -
+  // which makes it a genuine test of the piece and not a separate demo mode. The
+  // magnitude is random within the range that triggers a storm, so a press is
+  // always violent; `window.__fake(mag)` is there for anything more specific.
+  window.__fake = (mag) => { fireQuake(mag == null ? 5.5 + Math.random() * 2 : mag); };
+  window.addEventListener("keydown", (e) => {
+    if (e.code !== "Space" || e.repeat) return;
+    e.preventDefault();              // stop the page scrolling on the keypress
+    window.__fake();
+  });
+
+  layout();
+  fetchQuakes();
+  setInterval(fetchQuakes, EQ_POLL_MS);
+  requestAnimationFrame(tick);
+})();
+</script>
+</body>
+</html>
