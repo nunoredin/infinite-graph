@@ -1,2 +1,6 @@
 .DS_Store
 *.log
+
+# Local dev server (not part of the deployed site — GitHub Pages serves
+# static files with Range support natively).
+serve.py
