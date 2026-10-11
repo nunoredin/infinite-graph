@@ -1,0 +1,3 @@
+A live graph displays earthquake related imagery in an infinite scroll. The scroll, imagery, and the graph itself are affected by live earthquake data provided by USGS.GOV. It also emits MIDI signals when activated, that work as an earthquake siren. 
+ This exists as a sort of existential trap for earthquakes. The repeated showing of these images creates a causality effect, attracting and bringing them closer to reality, until they actually happen. When they are captured in our reality, their destructive force destroys the presented imagery, leading to their own demise. 
+ The siren that plays exists both as a mythical entity (The singer that pulls the sailor and the pirate to their deaths) and as a warning that an earthquake has been captured and defeated by itself.
